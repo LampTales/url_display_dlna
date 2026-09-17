@@ -1,24 +1,205 @@
 package com.cloudmusic2ktv.dlna;
 
-import java.io.*; import java.net.*; import java.nio.charset.StandardCharsets; import java.util.*;
-import javax.xml.parsers.DocumentBuilderFactory; import org.w3c.dom.*;
+import org.w3c.dom.Document;
+import org.w3c.dom.Element;
+import org.w3c.dom.NodeList;
+import org.xml.sax.SAXException;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.HttpURLConnection;
+import java.net.InetAddress;
+import java.net.SocketTimeoutException;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Set;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.DocumentBuilder;
+import javax.xml.parsers.ParserConfigurationException;
 
 public final class DlnaRenderer {
-  public final String name, location; private final String controlUrl;
-  private DlnaRenderer(String n,String l,String c){name=n;location=l;controlUrl=c;}
-  public static List<DlnaRenderer> discover(int timeoutMs) throws IOException {
-    List<DlnaRenderer> out=new ArrayList<>(); DatagramSocket s=new DatagramSocket(); s.setSoTimeout(timeoutMs);
-    String q="M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
-    byte[] b=q.getBytes(StandardCharsets.US_ASCII); s.send(new DatagramPacket(b,b.length,InetAddress.getByName("239.255.255.250"),1900));
-    Set<String> seen=new HashSet<>(); long end=System.currentTimeMillis()+timeoutMs;
-    while(System.currentTimeMillis()<end){try{byte[] x=new byte[4096]; DatagramPacket p=new DatagramPacket(x,x.length); s.receive(p); String h=new String(p.getData(),0,p.getLength(),StandardCharsets.ISO_8859_1); String loc=header(h,"location"); if(loc!=null&&seen.add(loc)){DlnaRenderer r=fromDescription(loc);if(r!=null)out.add(r);}}catch(SocketTimeoutException e){break;}}
-    s.close(); return out;
-  }
-  private static DlnaRenderer fromDescription(String loc){try{HttpURLConnection c=(HttpURLConnection)new URL(loc).openConnection();c.setConnectTimeout(3000);c.setReadTimeout(3000);Document d=DocumentBuilderFactory.newInstance().newDocumentBuilder().parse(c.getInputStream());String name=text(d,"friendlyName"), base=loc;String control=null;NodeList n=d.getElementsByTagNameNS("*","service");for(int i=0;i<n.getLength();i++){Element e=(Element)n.item(i);if("urn:schemas-upnp-org:service:AVTransport:1".equals(text(e,"serviceType"))){control=text(e,"controlURL");break;}}if(control==null)return null;return new DlnaRenderer(name,loc,new URL(new URL(base),control).toString());}catch(Exception e){return null;}}
-  private static String text(Node n,String tag){NodeList x=((Document)n).getElementsByTagNameNS("*",tag);return x.getLength()==0?null:x.item(0).getTextContent().trim();} private static String text(Element n,String tag){NodeList x=n.getElementsByTagNameNS("*",tag);return x.getLength()==0?null:x.item(0).getTextContent().trim();}
-  private static String header(String h,String k){for(String l:h.split("\\r?\\n"))if(l.toLowerCase(Locale.ROOT).startsWith(k+":"))return l.substring(k.length()+1).trim();return null;}
-  public void play(String mediaUrl) throws IOException {soap("SetAVTransportURI","<InstanceID>0</InstanceID><CurrentURI>"+esc(mediaUrl)+"</CurrentURI><CurrentURIMetaData></CurrentURIMetaData>");soap("Play","<InstanceID>0</InstanceID><Speed>1</Speed>");}
-  private void soap(String action,String body)throws IOException{String xml="<?xml version=\"1.0\"?><s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><u:"+action+" xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">"+body+"</u:"+action+"></s:Body></s:Envelope>";HttpURLConnection c=(HttpURLConnection)new URL(controlUrl).openConnection();c.setRequestMethod("POST");c.setDoOutput(true);c.setRequestProperty("Content-Type","text/xml; charset=\"utf-8\"");c.setRequestProperty("SOAPACTION","\"urn:schemas-upnp-org:service:AVTransport:1#"+action+"\"");c.getOutputStream().write(xml.getBytes(StandardCharsets.UTF_8));if(c.getResponseCode()/100!=2)throw new IOException("DLNA SOAP "+c.getResponseCode());}
-  private static String esc(String s){return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\"","&quot;");}
-  public String toString(){return name==null?location:name;}
+    private static final Logger LOGGER = Logger.getLogger("UrlDisplayDlna");
+    private static final String AV_TRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1";
+    private static final int HTTP_TIMEOUT_MS = 3000;
+
+    public final String name;
+    public final String location;
+    private final String controlUrl;
+
+    private DlnaRenderer(String name, String location, String controlUrl) {
+        this.name = name;
+        this.location = location;
+        this.controlUrl = controlUrl;
+    }
+
+    public static List<DlnaRenderer> discover(int timeoutMs) throws IOException {
+        List<DlnaRenderer> renderers = new ArrayList<>();
+        String searchRequest = "M-SEARCH * HTTP/1.1\r\n"
+                + "HOST: 239.255.255.250:1900\r\n"
+                + "MAN: \"ssdp:discover\"\r\n"
+                + "MX: 2\r\n"
+                + "ST: urn:schemas-upnp-org:device:MediaRenderer:1\r\n\r\n";
+        byte[] requestBytes = searchRequest.getBytes(StandardCharsets.US_ASCII);
+        Set<String> locations = new HashSet<>();
+
+        try (DatagramSocket socket = new DatagramSocket()) {
+            socket.send(new DatagramPacket(
+                    requestBytes,
+                    requestBytes.length,
+                    InetAddress.getByName("239.255.255.250"),
+                    1900
+            ));
+            long deadline = System.nanoTime() + timeoutMs * 1_000_000L;
+            while (System.nanoTime() < deadline) {
+                long remainingMs = (deadline - System.nanoTime()) / 1_000_000L;
+                socket.setSoTimeout((int) Math.max(1, remainingMs));
+                try {
+                    byte[] responseBytes = new byte[4096];
+                    DatagramPacket response = new DatagramPacket(responseBytes, responseBytes.length);
+                    socket.receive(response);
+                    String headers = new String(
+                            response.getData(), 0, response.getLength(), StandardCharsets.ISO_8859_1
+                    );
+                    String location = header(headers, "location");
+                    if (location != null) {
+                        locations.add(location);
+                    }
+                } catch (SocketTimeoutException error) {
+                    break;
+                }
+            }
+        }
+
+        // Fetch descriptions after discovery, so slow HTTP responses do not
+        // prevent us from collecting other devices' SSDP replies.
+        for (String location : locations) {
+            try {
+                DlnaRenderer renderer = fromDescription(location);
+                if (renderer != null) {
+                    renderers.add(renderer);
+                }
+            } catch (IOException error) {
+                LOGGER.log(Level.WARNING, "Unable to read a renderer description", error);
+            }
+        }
+        return renderers;
+    }
+
+    private static DlnaRenderer fromDescription(String location) throws IOException {
+        HttpURLConnection connection = (HttpURLConnection) new URL(location).openConnection();
+        connection.setConnectTimeout(HTTP_TIMEOUT_MS);
+        connection.setReadTimeout(HTTP_TIMEOUT_MS);
+        try (InputStream input = connection.getInputStream()) {
+            return parseDescription(location, input);
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    static DlnaRenderer parseDescription(String location, InputStream input) throws IOException {
+        try {
+            DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();
+            // UPnP descriptions use XML namespaces. Without this flag the
+            // getElementsByTagNameNS queries silently miss AVTransport services.
+            factory.setNamespaceAware(true);
+            DocumentBuilder builder = factory.newDocumentBuilder();
+            builder.setEntityResolver((publicId, systemId) -> {
+                throw new SAXException("External entities are not supported in DLNA descriptions");
+            });
+            Document document = builder.parse(input);
+            Element root = document.getDocumentElement();
+            if (document.getDoctype() != null) {
+                throw new IOException("DLNA device descriptions must not contain a DOCTYPE");
+            }
+            String name = text(root, "friendlyName");
+            String urlBase = text(root, "URLBase");
+            URL base = new URL(location);
+            if (urlBase != null && !urlBase.isEmpty()) {
+                base = new URL(base, urlBase);
+            }
+            NodeList services = root.getElementsByTagNameNS("*", "service");
+            for (int index = 0; index < services.getLength(); index++) {
+                Element service = (Element) services.item(index);
+                if (AV_TRANSPORT.equals(text(service, "serviceType"))) {
+                    String controlPath = text(service, "controlURL");
+                    if (controlPath != null && !controlPath.isEmpty()) {
+                        return new DlnaRenderer(name, location, new URL(base, controlPath).toString());
+                    }
+                }
+            }
+            return null;
+        } catch (ParserConfigurationException | SAXException error) {
+            throw new IOException("无法解析 DLNA 设备描述", error);
+        }
+    }
+
+    private static String text(Element element, String tag) {
+        NodeList matches = element.getElementsByTagNameNS("*", tag);
+        return matches.getLength() == 0 ? null : matches.item(0).getTextContent().trim();
+    }
+
+    private static String header(String headers, String key) {
+        for (String line : headers.split("\\r?\\n")) {
+            if (line.toLowerCase(Locale.ROOT).startsWith(key + ":")) {
+                return line.substring(key.length() + 1).trim();
+            }
+        }
+        return null;
+    }
+
+    public void play(String mediaUrl) throws IOException {
+        soap("SetAVTransportURI",
+                "<InstanceID>0</InstanceID>"
+                        + "<CurrentURI>" + escapeXml(mediaUrl) + "</CurrentURI>"
+                        + "<CurrentURIMetaData></CurrentURIMetaData>");
+        soap("Play", "<InstanceID>0</InstanceID><Speed>1</Speed>");
+    }
+
+    private void soap(String action, String body) throws IOException {
+        String xml = "<?xml version=\"1.0\"?>"
+                + "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\">"
+                + "<s:Body><u:" + action + " xmlns:u=\"" + AV_TRANSPORT + "\">"
+                + body
+                + "</u:" + action + "></s:Body></s:Envelope>";
+        HttpURLConnection connection = (HttpURLConnection) new URL(controlUrl).openConnection();
+        connection.setConnectTimeout(HTTP_TIMEOUT_MS);
+        connection.setReadTimeout(HTTP_TIMEOUT_MS);
+        connection.setRequestMethod("POST");
+        connection.setDoOutput(true);
+        connection.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"");
+        connection.setRequestProperty("SOAPACTION", "\"" + AV_TRANSPORT + "#" + action + "\"");
+        try {
+            try (OutputStream output = connection.getOutputStream()) {
+                output.write(xml.getBytes(StandardCharsets.UTF_8));
+            }
+            int status = connection.getResponseCode();
+            if (status / 100 != 2) {
+                throw new IOException("DLNA " + action + " failed (HTTP " + status + ")");
+            }
+        } finally {
+            connection.disconnect();
+        }
+    }
+
+    private static String escapeXml(String value) {
+        return value.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;");
+    }
+
+    @Override
+    public String toString() {
+        return name == null ? location : name;
+    }
 }
