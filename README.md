@@ -29,6 +29,47 @@ APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。覆盖安装时执行�
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
 
+## 没有实机时的本机模拟器
+
+`tools/mock_dlna_renderer.py` 是一个只依赖 Python 标准库的本机测试接收端。它会在 UDP 1900 响应
+SSDP `M-SEARCH`，在 HTTP 上提供 `MediaRenderer:1`、`AVTransport:1`、`RenderingControl:1` 和
+`ConnectionManager:1`，接受 UPnP 事件 `SUBSCRIBE`、回发初始 `NOTIFY`，并将视频 URL 交给工作区内的
+mpv 播放。它记录最近的 SOAP 请求和播放状态，可通过 `/state` 检查。
+
+工作区还包含 Windows x86_64 便携版 mpv，位于 `tools/mpv/mpv.exe`。它不需要写入系统目录或加入
+`PATH`，后续可由模拟器通过 IPC 控制，用于实际拉取并播放手机提供的 HTTP 视频地址。检查版本：
+
+```powershell
+.\tools\mpv\mpv.exe --version
+```
+
+在工作区的 PowerShell 中启动（默认启用 mpv）：
+
+```powershell
+python .\tools\mock_dlna_renderer.py --advertise-ip 192.168.1.101
+```
+
+也可以只测试 DLNA 协议而不启动播放器：
+
+```powershell
+python .\tools\mock_dlna_renderer.py --advertise-ip 192.168.1.101 --no-mpv
+```
+
+`--advertise-ip` 必须是手机能够访问的本机局域网 IPv4 地址；不确定时可以省略，脚本会尝试自动选择。
+看到 `Mock renderer ready` 后，在手机应用中点击“搜索 DLNA 设备”，应出现 `CloudMusic2KTV Mock Renderer`。
+点击该设备后，模拟器会在收到 `SetAVTransportURI` 时启动 mpv 并加载视频，在收到 `Play`、`Pause`、`Stop`
+和 `Seek` 时同步控制播放器；视频结束或切换视频后会继续发送 DLNA 状态事件。可在电脑浏览器打开
+`http://192.168.1.101:8765/state` 查看最后收到的 URI、播放器进程、播放状态和请求记录。若手机搜不到，先确认 Windows 防火墙允许 Python 接收 UDP 1900 和 TCP 8765；防火墙规则
+属于系统安全设置，需要手动决定是否添加。
+
+OPPO 视频会根据接收端报告的状态决定后续动作。模拟器现在采用 Macast 的握手：收到
+`SetAVTransportURI` 后立即让 mpv 加载视频，但对手机报告 `PAUSED_PLAYBACK`，等待手机发出
+`Play` 后再报告 `PLAYING`。这能避免手机把一次正常投屏误判为本地播放/Seek 流程；之后手机发来的
+`Pause`、`Seek`、`Stop` 仍会同步到 mpv。
+
+完整的设备发现、SCPD、GENA、SOAP、状态轮询和 Seek 交互记录见
+[docs/dlna-cast-session.md](docs/dlna-cast-session.md)。
+
 应用 ID 为 `com.cloudmusic2ktv.urldisplaydlna`，启动类为 `com.cloudmusic2ktv.dlna.MainActivity`。Manifest 使用完整类名，避免将 Gradle namespace 误当成 Java 包名。
 
 ## 本地验证

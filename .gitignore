@@ -2,3 +2,31 @@
 build/
 */build/
 local.properties
+
+# Android Studio and native build output
+.idea/
+*.iml
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Java/Kotlin and temporary compiler output
+*.class
+
+# Python tooling and local virtual environments
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+.venv-*/
+
+# Local diagnostics and ad-hoc test output
+*.log
+*.out
+*.err
+
+# Downloaded/reference tools kept outside version control
+tools/mpv/
+tools/Macast-reference/
+tools/*-reference/
+tools/macast-trace-data/
