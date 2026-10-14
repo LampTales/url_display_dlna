@@ -30,3 +30,7 @@ tools/mpv/
 tools/Macast-reference/
 tools/*-reference/
 tools/macast-trace-data/
+tools/phone-logcat*
+tools/renderer-state-history.ndjson
+tools/mock-trace*.ndjson
+tools/mock-session.pid

@@ -9,6 +9,8 @@ player.  Use /state to inspect the current request and playback state.
 from __future__ import annotations
 
 import argparse
+from collections import deque
+from dataclasses import dataclass, field
 import http.client
 import html
 import http.server
@@ -26,6 +28,10 @@ from typing import Callable
 from urllib.parse import urlparse
 
 from mpv_controller import MpvController, MpvUnavailable
+from diagnostic_trace import DiagnosticTrace
+
+
+trace = DiagnosticTrace()
 
 
 SSDP_ADDRESS = ("239.255.255.250", 1900)
@@ -34,6 +40,29 @@ DEVICE_URN = "uuid:cloudmusic2ktv-mock-renderer"
 AV_TRANSPORT = "urn:schemas-upnp-org:service:AVTransport:1"
 CONNECTION_MANAGER = "urn:schemas-upnp-org:service:ConnectionManager:1"
 RENDERING_CONTROL = "urn:schemas-upnp-org:service:RenderingControl:1"
+
+
+@dataclass
+class Subscription:
+    callback: str
+    service: str
+    expires: float
+    sequence: int = 0
+    failures: int = 0
+    ready: bool = False
+    sending: bool = False
+    pending: deque = field(default_factory=lambda: deque(maxlen=64))
+
+
+def subscription_timeout(value: str) -> int:
+    # GENA permits granting a shorter lifetime than requested. Even infinite
+    # requests receive a finite lease, explicitly advertised in the response.
+    if value.strip().lower() in ("", "infinite", "second-infinite"):
+        return 1800
+    match = re.fullmatch(r"Second-(\d{1,10})", value.strip(), re.IGNORECASE)
+    if not match or int(match[1]) < 1:
+        raise ValueError("invalid subscription timeout")
+    return min(int(match[1]), 1800)
 
 
 class RendererState:
@@ -48,8 +77,7 @@ class RendererState:
         self.duration = 0.0
         self.request_count = 0
         self.requests: list[dict[str, object]] = []
-        self.subscribers: dict[str, str] = {}
-        self._sequence = 0
+        self.subscribers: dict[str, Subscription] = {}
         self.on_state_change: Callable[[], None] | None = None
 
     def record(self, action: str, uri: str, body: str) -> None:
@@ -58,9 +86,8 @@ class RendererState:
             if uri:
                 self.last_uri = uri
             if action == "SetAVTransportURI":
-                # Match Macast's handshake: load the URI immediately but
-                # report PAUSED_PLAYBACK until the sender confirms the cast
-                # session with a Play action.
+                # Initial loading state; mpv events subsequently report the
+                # actual playback state even if the sender sends no Play.
                 self.transport_state = "PAUSED_PLAYBACK"
                 self.transport_status = "OK"
                 self.position = 0.0
@@ -85,6 +112,7 @@ class RendererState:
             self.transport_status = status
         if changed and notify and self.on_state_change:
             self.on_state_change()
+        trace("renderer.state", state=value, status=status, changed=changed, notify=notify)
 
     def set_position(self, position: float | None = None, duration: float | None = None) -> None:
         with self.lock:
@@ -93,22 +121,69 @@ class RendererState:
             if duration is not None:
                 self.duration = max(0.0, duration)
 
-    def subscribe(self, sid: str, callback: str) -> None:
-        with self.lock:
-            self.subscribers[sid] = callback
+    def _expire_subscriptions(self) -> None:
+        # Caller holds self.lock. Check on requests, notification dispatch, and
+        # the HTTP server's periodic service_actions, including while idle.
+        now = time.monotonic()
+        for sid, sub in list(self.subscribers.items()):
+            if sub.expires <= now:
+                del self.subscribers[sid]
+                trace("gena.expired", sid=sid, callback=sub.callback)
 
-    def unsubscribe(self, sid: str) -> None:
+    def expire_subscriptions(self) -> None:
         with self.lock:
-            self.subscribers.pop(sid, None)
+            self._expire_subscriptions()
 
-    def event_snapshot(self) -> tuple[dict[str, str], str, float, float, int]:
+    def subscribe(self, sid: str, callback: str, service: str, timeout: int) -> None:
         with self.lock:
-            sequence = self._sequence
-            self._sequence = (self._sequence + 1) % (2**32)
-            return dict(self.subscribers), self.transport_state, self.position, self.duration, sequence
+            self._expire_subscriptions()
+            for old_sid, sub in list(self.subscribers.items()):
+                if sub.callback == callback and sub.service == service:
+                    del self.subscribers[old_sid]
+                    trace("gena.replace", old_sid=old_sid, sid=sid, callback=callback)
+            self.subscribers[sid] = Subscription(callback, service, time.monotonic() + timeout)
+            trace("gena.subscribe", sid=sid, callback=callback, service=service, timeout=timeout)
+
+    def renew(self, sid: str, service: str, timeout: int) -> bool:
+        with self.lock:
+            self._expire_subscriptions()
+            sub = self.subscribers.get(sid)
+            if sub is None or sub.service != service:
+                return False
+            sub.expires = time.monotonic() + timeout
+            trace("gena.renew", sid=sid, timeout=timeout)
+            return True
+
+    def unsubscribe(self, sid: str, service: str) -> bool:
+        with self.lock:
+            self._expire_subscriptions()
+            sub = self.subscribers.get(sid)
+            if sub is None or sub.service != service:
+                return False
+            del self.subscribers[sid]
+            trace("gena.unsubscribe", sid=sid)
+            return True
+
+    def queue_events(self, initial_sid: str | None = None) -> None:
+        with self.lock:
+            self._expire_subscriptions()
+            for sid, sub in self.subscribers.items():
+                if initial_sid is not None:
+                    if sid != initial_sid:
+                        continue
+                    sub.ready = True
+                # RenderingControl leases are separate: never send them AVT XML.
+                if not sub.ready or sub.service != "AVTransport":
+                    continue
+                sub.pending.append((self.transport_state, self.position, self.duration))
+                if not sub.sending:
+                    sub.sending = True
+                    threading.Thread(target=deliver_events, args=(self, sid, sub),
+                                     name="gena-notify", daemon=True).start()
 
     def snapshot(self) -> dict[str, object]:
         with self.lock:
+            self._expire_subscriptions()
             return {
                 "last_action": self.last_action,
                 "last_uri": self.last_uri,
@@ -118,6 +193,12 @@ class RendererState:
                 "position": self.position,
                 "duration": self.duration,
                 "subscriber_count": len(self.subscribers),
+                "subscriptions": [
+                    {"sid": sid, "callback": sub.callback, "service": sub.service,
+                     "expires_in": max(0, round(sub.expires - time.monotonic(), 1)),
+                     "failures": sub.failures, "next_sequence": sub.sequence}
+                    for sid, sub in self.subscribers.items()
+                ],
                 "request_count": self.request_count,
                 "requests": list(self.requests),
             }
@@ -246,7 +327,8 @@ def soap_response(action: str, namespace: str = AV_TRANSPORT, state: RendererSta
     elif action == "GetTransportSettings":
         result = "<PlayMode>NORMAL</PlayMode><RecQualityMode>NOT_IMPLEMENTED</RecQualityMode>"
     return f'''<?xml version="1.0" encoding="utf-8"?>
-<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">
+<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/"
+            s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
   <s:Body><u:{action}Response xmlns:u="{namespace}">{result}</u:{action}Response></s:Body>
 </s:Envelope>
 '''.encode("utf-8")
@@ -259,12 +341,13 @@ def send_event(
     position: float,
     duration: float,
     sequence: int,
-) -> None:
+) -> int | None:
     """Send a UPnP LastChange event to a subscribed controller."""
+    connection = None
     try:
         parsed = urlparse(callback)
         if parsed.scheme != "http" or not parsed.hostname:
-            return
+            return None
         event = (
             '<Event xmlns="urn:schemas-upnp-org:metadata-1-0/AVT/">'
             '<InstanceID val="0">'
@@ -281,20 +364,56 @@ def send_event(
   <e:property><LastChange>{html.escape(event, quote=True)}</LastChange></e:property>
 </e:propertyset>'''.encode("utf-8")
         connection = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=2)
-        connection.request("NOTIFY", parsed.path or "/", body=body, headers={
+        headers = {
             "NT": "upnp:event",
             "NTS": "upnp:propchange",
             "SID": sid,
             "SEQ": str(sequence),
             "Content-Type": 'text/xml; charset="utf-8"',
             "Content-Length": str(len(body)),
-        })
+        }
+        trace("gena.send", callback=callback, headers=headers, body=body.decode("utf-8"))
+        target = parsed.path or "/"
+        if parsed.query:
+            target += "?" + parsed.query
+        connection.request("NOTIFY", target, body=body, headers=headers)
         response = connection.getresponse()
         response.read()
-        connection.close()
+        trace("gena.response", sid=sid, seq=sequence, status=response.status)
         print(f"NOTIFY {callback} -> HTTP {response.status}", flush=True)
+        return response.status
     except Exception as error:
+        trace("gena.error", sid=sid, seq=sequence, error=str(error))
         print(f"NOTIFY {callback} failed: {error}", flush=True)
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def deliver_events(state: RendererState, sid: str, sub: Subscription) -> None:
+    """One worker per subscription preserves event and SEQ ordering."""
+    while True:
+        with state.lock:
+            state._expire_subscriptions()
+            if state.subscribers.get(sid) is not sub or not sub.pending:
+                sub.sending = False
+                return
+            transport_state, position, duration = sub.pending.popleft()
+            sequence = sub.sequence
+            sub.sequence = 1 if sequence == 2**32 - 1 else sequence + 1
+        status = send_event(sub.callback, sid, transport_state, position, duration, sequence)
+        with state.lock:
+            if state.subscribers.get(sid) is not sub:
+                return
+            sub.failures = 0 if status is not None and 200 <= status < 300 else sub.failures + 1
+            # 412 means this SID is explicitly rejected. Tolerate isolated
+            # network failures, but stop sending after three consecutive ones.
+            if status == 412 or sub.failures >= 3:
+                del state.subscribers[sid]
+                trace("gena.remove_failed", sid=sid, callback=sub.callback,
+                      status=status, failures=sub.failures)
+                return
 
 
 def scpd_description(service: str) -> bytes:
@@ -423,6 +542,19 @@ def parse_time_value(value: str) -> float:
 class HttpHandler(http.server.BaseHTTPRequestHandler):
     server_version = "CloudMusic2KTVMock/1.0"
 
+    def parse_request(self) -> bool:
+        self.trace_id = uuid.uuid4().hex
+        result = super().parse_request()
+        if result:
+            trace("http.request", request_id=self.trace_id, peer=self.client_address,
+                  method=self.command, path=self.path, headers=list(self.headers.items()))
+        return result
+
+    def end_headers(self) -> None:
+        trace("http.response_headers", request_id=self.trace_id,
+              headers=b"".join(self._headers_buffer).decode("iso-8859-1"))
+        super().end_headers()
+
     @property
     def state(self) -> RendererState:
         return self.server.state  # type: ignore[attr-defined]
@@ -460,6 +592,8 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+        trace("http.response_body", request_id=self.trace_id, body=body.decode("utf-8"))
+
     def do_POST(self) -> None:  # noqa: N802
         path = urlparse(self.path).path
         if not (
@@ -472,6 +606,8 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             return
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length).decode("utf-8", errors="replace")
+        started = time.monotonic()
+        trace("soap.request", request_id=self.trace_id, body=body)
         action_header = self.headers.get("SOAPACTION", "").strip('"')
         action = action_header.rsplit("#", 1)[-1] if "#" in action_header else ""
         if not action:
@@ -483,6 +619,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
             if match:
                 uri = html.unescape(match.group(1).strip())
         self.state.record(action, uri, body)
+        trace("soap.action", request_id=self.trace_id, action=action, state=self.state.snapshot())
         print(f"SOAP {action}" + (f" URI={uri}" if uri else ""), flush=True)
         try:
             if self.player is not None:
@@ -516,6 +653,9 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(response)))
         self.end_headers()
         self.wfile.write(response)
+        trace("soap.response", request_id=self.trace_id, action=action,
+              elapsed=time.monotonic() - started, body=response.decode("utf-8"),
+              state=self.state.snapshot())
 
         # LastChange is the part that makes the phone keep a real cast session.
         # Send it only after the SOAP response has been written so a slow callback
@@ -535,30 +675,43 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
         ):
             self.send_error(404)
             return
-        sid = self.headers.get("SID") or f"uuid:{uuid.uuid4()}"
+        service = "AVTransport" if event_path.lower().endswith("/avtransport/event") else "RenderingControl"
+        timeout_header = self.headers.get("TIMEOUT", "Second-1800")
+        try:
+            timeout = subscription_timeout(timeout_header)
+        except ValueError:
+            self.send_error(400, "Invalid TIMEOUT")
+            return
+        requested_sid = self.headers.get("SID")
+        sid = requested_sid or f"uuid:{uuid.uuid4()}"
         callback_header = self.headers.get("CALLBACK", "")
         match = re.search(r"<([^>]+)>", callback_header)
         callback = match.group(1) if match else callback_header.strip().strip("<>")
-        path = urlparse(self.path).path
-        if callback and (path.endswith("/AVTransport/event") or path.endswith("/avtransport")):
-            self.state.subscribe(sid, callback)
+        if requested_sid:
+            if callback or not self.state.renew(sid, service, timeout):
+                self.send_error(412, "Unknown SID or callback on renewal")
+                return
+        else:
+            if not callback:
+                self.send_error(400, "Missing CALLBACK")
+                return
+            self.state.subscribe(sid, callback, service, timeout)
         self.send_response(200)
         self.send_header("SID", sid)
-        self.send_header("TIMEOUT", "Second-1800")
+        self.send_header("TIMEOUT", f"Second-{timeout}")
         self.send_header("Content-Length", "0")
         self.end_headers()
         print(f"SUBSCRIBE {self.path}", flush=True)
-        if callback and (path.endswith("/AVTransport/event") or path.endswith("/avtransport")):
-            _, transport_state, position, duration, sequence = self.state.event_snapshot()
-            threading.Thread(
-                target=send_event,
-                args=(callback, sid, transport_state, position, duration, sequence),
-                daemon=True,
-            ).start()
+        if not requested_sid and service == "AVTransport":
+            self.state.queue_events(sid)
 
     def do_UNSUBSCRIBE(self) -> None:  # noqa: N802
         sid = self.headers.get("SID", "")
-        self.state.unsubscribe(sid)
+        event_path = urlparse(self.path).path.lower()
+        service = "AVTransport" if event_path.endswith("/avtransport/event") else "RenderingControl"
+        if not self.state.unsubscribe(sid, service):
+            self.send_error(412, "Unknown SID")
+            return
         self.send_response(200)
         self.send_header("Content-Length", "0")
         self.end_headers()
@@ -568,13 +721,7 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
 
     @staticmethod
     def notify_subscribers_for_state(state: RendererState) -> None:
-        subscribers, transport_state, position, duration, sequence = state.event_snapshot()
-        for sid, callback in subscribers.items():
-            threading.Thread(
-                target=send_event,
-                args=(callback, sid, transport_state, position, duration, sequence),
-                daemon=True,
-            ).start()
+        state.queue_events()
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"HTTP {self.address_string()} - {format % args}", flush=True)
@@ -583,6 +730,9 @@ class HttpHandler(http.server.BaseHTTPRequestHandler):
 class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def service_actions(self) -> None:
+        self.state.expire_subscriptions()  # type: ignore[attr-defined]
 
 
 def ssdp_loop(http_port: int, advertise_ip: str, stop: threading.Event) -> None:
@@ -643,6 +793,7 @@ def ssdp_loop(http_port: int, advertise_ip: str, stop: threading.Event) -> None:
             text = packet.decode("iso-8859-1", errors="replace")
             if not text.upper().startswith("M-SEARCH"):
                 continue
+            trace("ssdp.search", peer=address, packet=text)
             headers = {}
             for line in text.splitlines()[1:]:
                 if ":" in line:
@@ -655,6 +806,7 @@ def ssdp_loop(http_port: int, advertise_ip: str, stop: threading.Event) -> None:
                     usn=f"{DEVICE_URN}::{target or DEVICE_TYPE}",
                 ).encode("ascii")
                 sock.sendto(response, address)
+                trace("ssdp.response", peer=address, packet=response.decode("ascii"))
                 print(f"SSDP reply to {address[0]}:{address[1]} ST={target}", flush=True)
     finally:
         sock.close()
@@ -668,7 +820,10 @@ def main() -> None:
     default_mpv = Path(__file__).with_name("mpv") / ("mpv.exe" if os.name == "nt" else "mpv")
     parser.add_argument("--mpv-path", default=str(default_mpv), help="mpv executable (default: bundled tools/mpv)")
     parser.add_argument("--no-mpv", action="store_true", help="only emulate DLNA control; do not launch mpv")
+    parser.add_argument("--trace-file", help="append full HTTP/GENA/mpv diagnostics as JSON lines")
     args = parser.parse_args()
+    if args.trace_file:
+        trace.open(args.trace_file)
     advertise_ip = args.advertise_ip or local_ip()
     state = RendererState()
     httpd = ThreadingHTTPServer((args.host, args.port), HttpHandler)
@@ -681,6 +836,7 @@ def main() -> None:
             args.mpv_path,
             on_state_change=lambda value: state.set_transport_state(value, notify=True),
             on_position_change=state.set_position,
+            on_trace=trace,
         )
         httpd.player = player  # type: ignore[attr-defined]
     else:
@@ -690,6 +846,7 @@ def main() -> None:
     thread.start()
     print(f"Mock renderer ready: {httpd.base_url}/device.xml", flush=True)
     print(f"Inspect state: {httpd.base_url}/state", flush=True)
+    trace("renderer.start", pid=os.getpid(), address=httpd.base_url, mpv=args.mpv_path)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

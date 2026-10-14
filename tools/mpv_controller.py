@@ -33,11 +33,13 @@ class MpvController:
         on_state_change: Callable[[str], None] | None = None,
         on_position_change: Callable[[float | None, float | None], None] | None = None,
         on_log: Callable[[str], None] | None = None,
+        on_trace: Callable[..., None] | None = None,
     ) -> None:
         self.executable = Path(executable)
         self.on_state_change = on_state_change
         self.on_position_change = on_position_change
         self.on_log = on_log or (lambda message: print(message, flush=True))
+        self._trace = on_trace or (lambda *args, **kwargs: None)
         self._process: subprocess.Popen[bytes] | None = None
         self._event_pipe: Any = None
         self._pipe_handle: int | None = None
@@ -47,9 +49,10 @@ class MpvController:
         self._reader: threading.Thread | None = None
         self._stop = threading.Event()
         self._state = "STOPPED"
-        # Suppress mpv's transient pause-property event while SetURI is being
-        # acknowledged. Macast reports PAUSED_PLAYBACK until Play arrives.
-        self._awaiting_play = False
+        # Idle mpv also reports pause=False. Only publish playback state once
+        # a file has started; do not require a separate SOAP Play action.
+        self._media_active = False
+        self._paused = False
         self._position = 0.0
         self._duration = 0.0
         self._path = ""
@@ -80,9 +83,12 @@ class MpvController:
             f"--input-ipc-server={self._pipe_name}",
         ]
         try:
+            self._trace("mpv.start", args=args)
             self._process = subprocess.Popen(args)
             self._event_pipe = self._connect_pipe(timeout=6.0)
         except Exception as error:
+            self._trace("mpv.start_error", error=str(error),
+                        exit_code=self._process.poll() if self._process else None)
             self.close()
             raise MpvUnavailable(f"unable to start mpv: {error}") from error
         self._reader = threading.Thread(target=self._reader_loop, name="mpv-ipc", daemon=True)
@@ -131,27 +137,25 @@ class MpvController:
         self._path = uri
         self._position = 0.0
         self._duration = 0.0
-        # Match Macast's handshake: load immediately, but report paused until
-        # the sender confirms the cast session with Play.
-        self._awaiting_play = True
+        self._media_active = False
         self._state = "PAUSED_PLAYBACK"
         self._send(["loadfile", uri, "replace"], wait=False)
+        # A new cast must also resume mpv if the previous file was paused.
+        self._send(["set_property", "pause", False], wait=False)
 
     def play(self) -> None:
         self.start()
-        self._awaiting_play = False
         self._state = "PLAYING"
         self._send(["set_property", "pause", False], wait=False)
 
     def pause(self) -> None:
         if self.running:
-            self._awaiting_play = False
             self._state = "PAUSED_PLAYBACK"
             self._send(["set_property", "pause", True], wait=False)
 
     def stop(self) -> None:
         if self.running:
-            self._awaiting_play = False
+            self._media_active = False
             self._state = "STOPPED"
             self._send(["stop"], wait=False)
 
@@ -186,6 +190,7 @@ class MpvController:
         with self._write_lock:
             self._request_id += 1
             payload = {"command": ["observe_property", self._request_id, name]}
+            self._trace("mpv.command", payload=payload)
             pipe.write((json.dumps(payload) + "\n").encode("utf-8"))
             pipe.flush()
 
@@ -196,12 +201,14 @@ class MpvController:
             self._request_id += 1
             request_id = self._request_id
             payload = {"command": command, "request_id": request_id}
+            self._trace("mpv.command", payload=payload)
             pipe = None
             try:
                 pipe = self._connect_pipe(timeout=3.0)
                 pipe.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
                 pipe.flush()
             except (OSError, ValueError) as error:
+                self._trace("mpv.command_error", request_id=request_id, error=str(error))
                 self._log(f"mpv IPC write failed: {error}")
                 return None
             if not wait:
@@ -221,6 +228,7 @@ class MpvController:
                         message = json.loads(line.decode("utf-8", errors="replace"))
                     except json.JSONDecodeError:
                         continue
+                    self._trace("mpv.reply", message=message)
                     if message.get("request_id") == request_id:
                         result.update(message)
                         break
@@ -244,6 +252,8 @@ class MpvController:
                     message = json.loads(line.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
                     continue
+                self._trace("mpv.event", message=message, media_active=self._media_active,
+                            state=self._state)
                 if message.get("event"):
                     self._handle_event(message)
         except (OSError, ValueError) as error:
@@ -252,7 +262,16 @@ class MpvController:
 
     def _handle_event(self, message: dict[str, Any]) -> None:
         event = message.get("event")
+        if event == "start-file":
+            self._media_active = True
+            return
+        if event == "playback-restart":
+            if self._media_active:
+                self._state = "PAUSED_PLAYBACK" if self._paused else "PLAYING"
+                self._emit_state()
+            return
         if event == "end-file":
+            self._media_active = False
             self._state = "STOPPED"
             self._emit_state()
             return
@@ -271,12 +290,13 @@ class MpvController:
         elif name == "path" and isinstance(value, str):
             self._path = value
         elif name == "pause" and isinstance(value, bool):
-            if self._state != "STOPPED":
+            self._paused = value
+            if self._media_active:
                 self._state = "PAUSED_PLAYBACK" if value else "PLAYING"
-            if not self._awaiting_play:
                 self._emit_state()
 
     def _emit_state(self) -> None:
+        self._trace("mpv.state", state=self._state)
         if self.on_state_change:
             try:
                 self.on_state_change(self._state)
