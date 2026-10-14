@@ -753,7 +753,9 @@ def ssdp_loop(http_port: int, advertise_ip: str, stop: threading.Event) -> None:
         raise RuntimeError("无法绑定 UDP 1900；可能已有 UPnP 服务占用该端口") from error
     # M-SEARCH is sent to the SSDP multicast group.  Joining the group is
     # required on Windows; binding to 0.0.0.0 alone is not sufficient.
-    membership = struct.pack("4s4s", socket.inet_aton(SSDP_ADDRESS[0]), socket.inet_aton("0.0.0.0"))
+    # Receive discovery on the advertised LAN, not a default route that may
+    # belong to a VPN/virtual adapter on a multi-interface Windows machine.
+    membership = struct.pack("4s4s", socket.inet_aton(SSDP_ADDRESS[0]), socket.inet_aton(advertise_ip))
     sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
     try:
         sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(advertise_ip))

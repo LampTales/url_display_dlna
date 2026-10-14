@@ -8,6 +8,41 @@
 - 通过 SSDP 搜索 `MediaRenderer:1`；
 - 读取设备描述并定位 `AVTransport:1`；
 - 调用 `SetAVTransportURI` 和 `Play` 播放视频。
+- 查询实际播放状态、时长和进度；支持暂停/继续、拖动进度、停止并断开；
+- 向当前设备换投输入框中的链接，支持直接再次接收系统分享；
+- 可选手机 HTTP 中转，让接收端访问手机局域网地址；支持 Range、HEAD 和前台服务；
+- 控制请求串行执行，前台约每秒轮询一次，退到后台停止轮询，回到前台恢复。
+
+0.3.0 使用进程内会话保存当前设备：旋转屏幕和前后台切换后可以继续控制；系统杀进程
+或强制停止 App 后需重新搜索并投屏。点击“停止并断开”会发送 Stop；设备不可达时可以
+选择“仅断开控制”，此时无法保证屏幕已经停止播放，但会关闭手机中转。输入链接需要是
+HTTP/HTTPS 视频直链；网页解析、登录 Cookie 转发和视频转码尚未实现。
+
+## 手机中转模式
+
+输入框下勾选“手机中转”，再选择设备或点击“投送输入框中的视频”。未勾选时，屏幕直接
+访问原始链接；勾选后，屏幕访问 `http://手机Wi-Fi地址:随机端口/video/随机标识`，手机
+通过当前 Wi-Fi 从原链接下载并边读边转发。模式选择会保存，在下一次投送时生效；当前
+播放状态旁会显示实际使用的模式。
+
+- 支持 GET、HEAD、Range/If-Range、206/416 和最多 5 次 HTTP/HTTPS 重定向。
+  原链接的签名参数保留在手机请求中，重定向也由手机处理。
+- 不做转码或整片缓存；单个请求使用 64 KiB 缓冲区，最多同时处理 4 个请求。
+  源站不支持 Range 时会如实转发 200，不能保证此类源站支持拖动。
+- 中转使用带通知的前台服务和唤醒锁，便于切后台、熄屏后继续提供视频。
+  Android 13+ 首次使用时会申请通知权限；拒绝通知仍可中转，但需要回到 App 停止。
+- ColorOS/Android 的省电策略可能在锁屏时限制新的入站连接。勾选中转后，App 会提供
+  “允许后台运行（减少锁屏中断）”入口；需要时在系统设置中允许本 App 忽略电池优化。
+  这是用户主动选择的耗电权衡，不能保证所有厂商固件都允许锁屏接收新连接。
+- 默认勾选“中转时保持此页亮屏”，仅在正在中转且此页前台可见时生效，可手动关闭。
+  它不阻止手动锁屏；本机锁屏后新连接曾超时，后续解锁时也出现过局域网 HTTP 超时，
+  尚不能确定唯一原因，当前不承诺锁屏投屏稳定性。
+- 暂停或播放结束时保留中转，方便后续控制；使用“停止并断开”或通知栏“停止投屏”结束。
+  切回直链、换投成功、仅断开控制会关闭旧地址；Wi-Fi 丢失或手机地址改变会终止中转，需重新投屏。
+
+手机中转要求屏幕能访问手机局域网地址，且手机的 Wi-Fi 能访问源站。它会增加手机耗电及
+局域网传输量，不能修复不兼容的视频编码，也不会让过期的签名链接重新有效。没有自动
+下载缓存、蜂窝网络回退、自动刷新签名或网络恢复后自动续投。本功能尚需纯 K 实地验证。
 
 项目使用标准 DLNA/UPnP 控制链路。实地测试前仍需确认设备的 SOAP 参数、元数据要求、HTTP/HTTPS 可达性和编码兼容性。
 
@@ -21,7 +56,23 @@ export ANDROID_HOME="$HOME/Library/Android/sdk"
 ./gradlew assembleDebug
 ```
 
-以上 Java 路径适用于 Apple Silicon macOS 的 Homebrew 安装；其他环境请使用对应的 JDK 17 路径。Wrapper 固定使用 Gradle 8.7，无需另外安装全局 Gradle。
+以上 Java 路径适用于 Apple Silicon macOS 的 Homebrew 安装；其他环境请使用对应的 JDK 17 路径。
+Wrapper 固定使用 Gradle 8.14.3，无需另外安装全局 Gradle。本机曾出现 transform
+缓存目录移动失败；升级后仍遇到一次，处理失败的缓存目录后构建与离线构建均已通过。
+
+本工作区 Windows 命令行构建：
+
+```powershell
+. ..\android-tools\activate.ps1
+.\gradlew.bat assembleDebug testDebugUnitTest lintDebug
+```
+
+激活脚本将 JDK、SDK 和 `GRADLE_USER_HOME` 都指向工作区内的 `android-tools`。
+依赖已缓存后可以添加 `--offline`。若首次下载需要本机代理，可在当前终端设置：
+
+```powershell
+$env:GRADLE_OPTS='-Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=7897 -Dhttps.proxyHost=127.0.0.1 -Dhttps.proxyPort=7897'
+```
 
 APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。覆盖安装时执行：
 
@@ -62,10 +113,11 @@ python .\tools\mock_dlna_renderer.py --advertise-ip 192.168.1.101 --no-mpv
 `http://192.168.1.101:8765/state` 查看最后收到的 URI、播放器进程、播放状态和请求记录。若手机搜不到，先确认 Windows 防火墙允许 Python 接收 UDP 1900 和 TCP 8765；防火墙规则
 属于系统安全设置，需要手动决定是否添加。
 
-OPPO 视频会根据接收端报告的状态决定后续动作。模拟器现在采用 Macast 的握手：收到
-`SetAVTransportURI` 后立即让 mpv 加载视频，但对手机报告 `PAUSED_PLAYBACK`，等待手机发出
-`Play` 后再报告 `PLAYING`。这能避免手机把一次正常投屏误判为本地播放/Seek 流程；之后手机发来的
-`Pause`、`Seek`、`Stop` 仍会同步到 mpv。
+OPPO 视频会根据接收端报告的状态决定后续动作。模拟器在收到 `SetAVTransportURI` 后立即让
+mpv 加载视频，并根据 mpv 的实际事件报告 `PAUSED_PLAYBACK` 或 `PLAYING`；手机发来的
+`Play`、`Pause`、`Seek`、`Stop` 也会同步到 mpv。Windows 多网卡环境下，
+`--advertise-ip` 同时决定设备描述中的地址和 SSDP 组播接收网卡，应填写手机可访问的
+Wi-Fi IPv4 地址。
 
 完整的设备发现、SCPD、GENA、SOAP、状态轮询和 Seek 交互记录见
 [docs/dlna-cast-session.md](docs/dlna-cast-session.md)。
@@ -78,7 +130,9 @@ OPPO 视频会根据接收端报告的状态决定后续动作。模拟器现在
 ./gradlew testDebugUnitTest lintDebug
 ```
 
-单元测试检查带命名空间的 UPnP 描述、缺少 AVTransport 的设备，以及向本机模拟端点按顺序发送 SetAVTransportURI / Play。Lint 检查 Manifest 中的 Activity 是否存在。这些检查不能替代真实 Android 启动和局域网投屏测试。
+单元测试检查带命名空间的 UPnP 描述、缺少 AVTransport 的设备、带签名链接及媒体元数据、
+控制命令与状态解析、SOAP Fault 和输入校验。Lint 检查包括 Manifest 中的 Activity 是否存在。
+这些检查不能替代真实 Android 启动和局域网投屏测试。
 
 ## 手机日志
 
