@@ -29,5 +29,6 @@
                 <data android:mimeType="text/plain" />
             </intent-filter>
         </activity>
+        <activity android:name="com.cloudmusic2ktv.dlna.CastDetailActivity" android:exported="false" />
     </application>
 </manifest>

@@ -35,6 +35,7 @@ final class CastSession {
     private boolean stopRequested;
     private int generation;
     private boolean polling;
+    private boolean playbackStarted;
     private int failures;
     private final Runnable tick = this::poll;
 
@@ -84,7 +85,7 @@ final class CastSession {
             }
             return;
         }
-        renderer = target; mediaUrl = displayUrl; info = null; reachable = false;
+        renderer = target; mediaUrl = displayUrl; info = null; reachable = false; playbackStarted = false;
         RelayService owner = service;
         HttpRelay[] candidate = new HttpRelay[1];
         command("正在投送视频…", () -> {
@@ -92,6 +93,7 @@ final class CastSession {
             target.play(useRelay ? candidate[0].url() : displayUrl);
         }, false, error -> {
             if (error == null) {
+                playbackStarted = true;
                 if (useRelay) {
                     owner.discard(relay); relay = candidate[0]; relaying = true;
                 } else releaseRelay();
@@ -133,6 +135,7 @@ final class CastSession {
     void relayLost(RelayService lost) {
         if (lost == null || service != lost) return;
         generation++; busy = false; renderer = null; info = null; reachable = false;
+        playbackStarted = false;
         main.removeCallbacks(tick); releaseRelay();
         message = "Wi-Fi 已断开或地址变化，手机中转已停止，请重新连接后投屏"; publish();
     }
@@ -153,6 +156,7 @@ final class CastSession {
         boolean wasRelaying = relaying;
         generation++; releaseRelay();
         renderer = null; info = null; reachable = false;
+        playbackStarted = false;
         message = wasRelaying ? "已断开控制并停止手机中转" : "已断开控制；设备上的播放可能仍在继续";
         publish();
     }
@@ -179,6 +183,7 @@ final class CastSession {
                 if (result == null && disconnect) {
                     releaseRelay();
                     renderer = null; info = null; reachable = false;
+                    playbackStarted = false;
                     message = "已停止并断开，可以选择其他视频或设备";
                 } else {
                     message = result == null ? "命令已发送，正在确认播放状态…" : "操作失败：" + result;
@@ -212,6 +217,17 @@ final class CastSession {
                 if (renderer == target && !busy) {
                     reachable = result != null;
                     if (result != null) {
+                        if ("PLAYING".equals(result.state) || "PAUSED_PLAYBACK".equals(result.state)) {
+                            playbackStarted = true;
+                        }
+                        if (playbackStarted && "STOPPED".equals(result.state)) {
+                            playbackStarted = false;
+                            releaseRelay();
+                            renderer = null; info = null; reachable = false;
+                            message = "播放已结束";
+                            publish();
+                            return;
+                        }
                         info = result; failures = 0;
                         if (!message.startsWith("操作失败：")) message = "";
                     } else {

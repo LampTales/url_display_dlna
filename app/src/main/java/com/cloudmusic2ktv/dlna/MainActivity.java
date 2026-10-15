@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.annotation.SuppressLint;
 import android.app.AlertDialog;
 import android.content.Intent;
+import android.graphics.Color;
+import android.graphics.Rect;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
 import android.text.InputType;
@@ -11,9 +13,12 @@ import android.text.Editable;
 import android.text.TextWatcher;
 import android.util.Log;
 import android.view.View;
+import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.WindowManager;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
+import android.widget.FrameLayout;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
@@ -40,10 +45,12 @@ public class MainActivity extends Activity {
     private final CastSession.Listener listener = this::render;
     private EditText urlInput;
     private LinearLayout deviceList;
-    private Button scanButton, pauseButton, stopButton, castButton, forgetButton;
+    private Button scanButton, pauseButton, stopButton, castButton, forgetButton, castingBar;
+    private TextView clearButton;
     private TextView stateText, messageText, timeText;
     private SeekBar seekBar;
     private CheckBox relayMode;
+    private TextView relayHint;
     private CheckBox keepAwake;
     private Button backgroundButton;
     private Button localButton;
@@ -53,12 +60,38 @@ public class MainActivity extends Activity {
     private static final int PICK_LOCAL_VIDEO = 41;
     private boolean dragging;
 
+    /**
+     * EditText keeps focus when a click lands on an otherwise empty part of a
+     * ScrollView because the child hierarchy may consume the touch first. Do
+     * this at the Activity boundary so every in-app tap outside the editor
+     * behaves like a normal form dismissal.
+     */
+    @Override public boolean dispatchTouchEvent(MotionEvent event) {
+        if (event.getAction() == MotionEvent.ACTION_DOWN && urlInput != null
+                && urlInput.hasFocus()
+                && !containsTouch(urlInput, event)
+                && !containsTouch(clearButton, event)) {
+            hideKeyboard();
+        }
+        return super.dispatchTouchEvent(event);
+    }
+
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
+        getWindow().setStatusBarColor(Ui.BACKGROUND);
+        getWindow().setNavigationBarColor(Ui.BACKGROUND);
+        getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR
+                | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR);
         session.initialize(this);
+        LinearLayout outer = new LinearLayout(this);
+        outer.setOrientation(LinearLayout.VERTICAL);
+        outer.setBackgroundColor(Ui.BACKGROUND);
         ScrollView scroll = new ScrollView(this);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Ui.BACKGROUND);
+        root.setFocusableInTouchMode(true);
+        root.setOnClickListener(view -> { hideKeyboard(); root.requestFocus(); });
         int padding = (int) (16 * getResources().getDisplayMetrics().density);
         root.setPadding(padding, padding, padding, padding);
         scroll.addView(root);
@@ -68,35 +101,81 @@ public class MainActivity extends Activity {
                     insets.getSystemWindowInsetRight(), insets.getSystemWindowInsetBottom());
             return insets;
         });
-        TextView title = new TextView(this);
-        title.setText("视频链接投屏"); title.setTextSize(24); root.addView(title);
+        scroll.setClickable(true);
+        scroll.setOnClickListener(view -> { hideKeyboard(); root.requestFocus(); });
+        scroll.setOnTouchListener((view, event) -> {
+            if (event.getAction() == MotionEvent.ACTION_DOWN
+                    && !containsTouch(urlInput, event) && !containsTouch(clearButton, event)) {
+                hideKeyboard(); root.requestFocus();
+            }
+            return false;
+        });
+        TextView title = Ui.label(this, "视频投屏", 24, Ui.BLACK); root.addView(title);
+        Ui.margin(title, 0, 0, 0, Ui.dp(this, 16));
+        FrameLayout urlField = new FrameLayout(this);
         urlInput = new EditText(this);
         urlInput.setId(View.generateViewId());
         urlInput.setHint("HTTP/HTTPS 视频直链");
         urlInput.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
         urlInput.setSingleLine(true);
-        root.addView(urlInput);
+        urlInput.setTextColor(Ui.BLACK); urlInput.setHintTextColor(Ui.MUTED);
+        urlInput.setPadding(0, 0, Ui.dp(this, 40), 0);
+        urlInput.setBackgroundColor(Color.TRANSPARENT);
+        urlInput.setGravity(Gravity.CENTER_VERTICAL);
+        urlInput.setIncludeFontPadding(false);
+        urlInput.setMinHeight(0);
+        urlInput.setMinimumHeight(0);
+        urlField.addView(urlInput, new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, Ui.dp(this, 30)));
+        // Give the editor edge enough contrast to read as one control with its hint.
+        View underline = new View(this); underline.setBackgroundColor(Color.rgb(202, 202, 207));
+        FrameLayout.LayoutParams lineParams = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, Ui.dp(this, 1), Gravity.BOTTOM);
+        urlField.addView(underline, lineParams);
+        clearButton = Ui.label(this, "×", 24, Ui.MUTED);
+        clearButton.setGravity(Gravity.CENTER); clearButton.setContentDescription("清空链接");
+        clearButton.setPadding(0, 0, 0, 0);
+        clearButton.setVisibility(View.GONE);
+        clearButton.setOnClickListener(view -> {
+            settingLocal = false;
+            localVideo = null;
+            localMime = null;
+            urlInput.setText("");
+            urlInput.requestFocus();
+            updateClearVisibility();
+        });
+        FrameLayout.LayoutParams clearParams = new FrameLayout.LayoutParams(
+                Ui.dp(this, 40), Ui.dp(this, 30), Gravity.END | Gravity.CENTER_VERTICAL);
+        urlField.addView(clearButton, clearParams);
+        root.addView(urlField, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(this, 32)));
+        TextView urlHint = Ui.label(this, "分享视频链接，或选择手机本地视频", 13, Ui.MUTED);
+        root.addView(urlHint);
+        Ui.margin(urlHint, 0, Ui.dp(this, 8), 0, Ui.dp(this, 8));
+        urlInput.setOnFocusChangeListener((view, focused) -> updateClearVisibility());
         urlInput.addTextChangedListener(new TextWatcher() {
             public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
             public void onTextChanged(CharSequence s, int start, int before, int count) { }
             public void afterTextChanged(Editable value) {
                 if (!settingLocal) { localVideo = null; localMime = null; }
+                urlInput.setError(null);
+                updateClearVisibility();
             }
         });
         localButton = button(root, "选择本地视频", this::chooseLocalVideo);
         relayMode = new CheckBox(this);
-        relayMode.setText("手机中转（适合直链播放失败时）");
+        relayMode.setText("手机中转");
         relayMode.setChecked(getPreferences(MODE_PRIVATE).getBoolean("relay", false));
         relayMode.setOnCheckedChangeListener((button, checked) -> {
             getPreferences(MODE_PRIVATE).edit().putBoolean("relay", checked).apply();
             updateBackgroundOption();
         });
         root.addView(relayMode);
-        TextView relayHint = new TextView(this);
-        relayHint.setText("默认由屏幕读取原链接。手机中转需保持 Wi-Fi 连接，模式在下次投送时生效。");
+        relayHint = Ui.label(this, "本地视频投屏将自动通过手机中转", 13, Ui.MUTED);
+        relayHint.setText("本地视频投屏将自动通过手机中转");
         root.addView(relayHint);
         keepAwake = new CheckBox(this);
-        keepAwake.setText("中转时保持此页亮屏（避免锁屏限制）");
+        keepAwake.setText("中转时保持常亮");
         keepAwake.setChecked(getPreferences(MODE_PRIVATE).getBoolean("keepAwake", true));
         keepAwake.setOnCheckedChangeListener((button, checked) -> {
             getPreferences(MODE_PRIVATE).edit().putBoolean("keepAwake", checked).apply();
@@ -104,9 +183,15 @@ public class MainActivity extends Activity {
         });
         root.addView(keepAwake);
         backgroundButton = button(root, "允许后台运行（减少锁屏中断）", this::allowBackground);
-        scanButton = button(root, "搜索 DLNA 设备", this::discover);
+        scanButton = Ui.button(this, "搜索 DLNA 设备", view -> discover(), true);
+        root.addView(scanButton); Ui.margin(scanButton, 0, Ui.dp(this, 10), 0, 0);
         deviceList = new LinearLayout(this);
-        deviceList.setOrientation(LinearLayout.VERTICAL); root.addView(deviceList);
+        deviceList.setOrientation(LinearLayout.VERTICAL); deviceList.setBackgroundColor(Ui.SURFACE); root.addView(deviceList);
+        castingBar = Ui.button(this, "未连接设备", view -> openCastDetails(), false);
+        castingBar.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        castingBar.setPadding(Ui.dp(this, 16), 0, Ui.dp(this, 16), 0);
+        castingBar.setBackground(Ui.background(Ui.SURFACE, 0, Ui.BORDER, Ui.dp(this, 1)));
+        castingBar.setVisibility(View.GONE);
         stateText = new TextView(this); stateText.setTextSize(18); root.addView(stateText);
         messageText = new TextView(this); root.addView(messageText);
         timeText = new TextView(this); root.addView(timeText);
@@ -132,7 +217,14 @@ public class MainActivity extends Activity {
                 .setMessage("直链视频可能仍在设备上播放；手机中转会停止。断开后可选择其他视频或设备。")
                 .setPositiveButton("断开控制", (dialog, which) -> session.forget())
                 .setNegativeButton("取消", null).show());
-        setContentView(scroll);
+        stateText.setVisibility(View.GONE); messageText.setVisibility(View.GONE); timeText.setVisibility(View.GONE);
+        seekBar.setVisibility(View.GONE); castButton.setVisibility(View.GONE); pauseButton.setVisibility(View.GONE);
+        stopButton.setVisibility(View.GONE); forgetButton.setVisibility(View.GONE);
+        outer.addView(scroll, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f));
+        outer.addView(castingBar, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(this, 52)));
+        setContentView(outer);
         if (saved != null) {
             urlInput.setText(saved.getString("input", ""));
             String savedUri = saved.getString("localUri", null);
@@ -144,8 +236,12 @@ public class MainActivity extends Activity {
     }
 
     private Button button(LinearLayout parent, String text, Runnable action) {
-        Button button = new Button(this); button.setText(text); button.setAllCaps(false);
-        button.setOnClickListener(view -> action.run()); parent.addView(button); return button;
+        Button button = Ui.button(this, text, view -> action.run(), false);
+        parent.addView(button); Ui.margin(button, 0, Ui.dp(this, 8), 0, 0); return button;
+    }
+
+    private void openCastDetails() {
+        startActivity(new Intent(this, CastDetailActivity.class));
     }
 
     @Override protected void onNewIntent(Intent intent) {
@@ -177,8 +273,16 @@ public class MainActivity extends Activity {
         if (info != null && !session.reachable) state = "状态暂不可用";
         stateText.setText(session.renderer == null ? "未连接设备" : session.renderer + "\n" + state
                 + (session.relaying ? " · 手机中转" : " · 直链"));
+        if (castingBar != null) {
+            castingBar.setVisibility(session.renderer == null ? View.GONE : View.VISIBLE);
+            castingBar.setText(session.renderer == null ? "未连接设备" : "投屏中 · " + session.renderer);
+            castingBar.setTextColor(Ui.BLACK);
+        }
         relayMode.setEnabled(!session.busy);
+        relayMode.setText("手机中转");
+        relayHint.setText("本地视频投屏将自动通过手机中转");
         localButton.setEnabled(!session.busy);
+        updateClearVisibility();
         updateBackgroundOption();
         messageText.setText(session.message);
         boolean active = info != null && ("PLAYING".equals(info.state) || "PAUSED_PLAYBACK".equals(info.state));
@@ -223,7 +327,16 @@ public class MainActivity extends Activity {
                     if (isFinishing() || isDestroyed()) return;
                     deviceList.removeAllViews();
                     if (found.isEmpty()) showDeviceMessage("没有发现设备，请确认同一 Wi-Fi 后重试");
-                    for (DlnaRenderer target : found) button(deviceList, target.toString(), () -> play(target));
+                    for (int i = 0; i < found.size(); i++) {
+                        DlnaRenderer target = found.get(i);
+                        TextView row = Ui.listRow(this, target.toString(), view -> play(target));
+                        deviceList.addView(row);
+                        if (i + 1 < found.size()) {
+                            View divider = new View(this); divider.setBackgroundColor(Ui.BORDER);
+                            deviceList.addView(divider, new LinearLayout.LayoutParams(
+                                    LinearLayout.LayoutParams.MATCH_PARENT, Ui.dp(this, 1)));
+                        }
+                    }
                     render();
                 });
             } catch (Exception error) {
@@ -244,11 +357,7 @@ public class MainActivity extends Activity {
 
     private void play(DlnaRenderer target) {
         if (localVideo != null) {
-            if (!relayMode.isChecked()) {
-                urlInput.setError("本地视频需要开启手机中转");
-                return;
-            }
-            hideKeyboard(); session.castLocal(target, localVideo, localMime);
+            hideKeyboard(); session.castLocal(target, localVideo, localMime); openCastDetails();
             return;
         }
         String url = urlInput.getText().toString().trim();
@@ -260,10 +369,11 @@ public class MainActivity extends Activity {
             getPreferences(MODE_PRIVATE).edit().putBoolean("notificationAsked", true).apply();
             requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1);
         }
-        hideKeyboard(); session.cast(target, url, relayMode.isChecked());
+        hideKeyboard(); session.cast(target, url, relayMode.isChecked()); openCastDetails();
     }
 
     private void chooseLocalVideo() {
+        hideKeyboard();
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
         intent.addCategory(Intent.CATEGORY_OPENABLE); intent.setType("video/*");
         intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION);
@@ -284,7 +394,20 @@ public class MainActivity extends Activity {
             if (cursor != null && cursor.moveToFirst()) name = cursor.getString(0);
         } catch (Exception ignored) { }
         settingLocal = true; urlInput.setText("本地视频：" + (name == null ? "已选择文件" : name)); settingLocal = false;
-        relayMode.setChecked(true); urlInput.clearFocus(); render();
+        urlInput.clearFocus(); render();
+    }
+
+    private void updateClearVisibility() {
+        if (clearButton == null || urlInput == null) return;
+        boolean visible = urlInput.hasFocus() && urlInput.length() > 0 && !session.busy;
+        clearButton.setVisibility(visible ? View.VISIBLE : View.GONE);
+    }
+
+    private boolean containsTouch(View target, MotionEvent event) {
+        if (target == null || target.getVisibility() != View.VISIBLE) return false;
+        Rect bounds = new Rect();
+        target.getGlobalVisibleRect(bounds);
+        return bounds.contains(Math.round(event.getRawX()), Math.round(event.getRawY()));
     }
 
     private void hideKeyboard() {
