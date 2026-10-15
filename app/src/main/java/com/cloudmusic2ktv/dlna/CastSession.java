@@ -10,6 +10,7 @@ import android.content.ComponentName;
 import android.content.ServiceConnection;
 import android.util.Log;
 import java.util.function.Consumer;
+import android.net.Uri;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -45,6 +46,17 @@ final class CastSession {
     }
 
     void cast(DlnaRenderer target, String url, boolean useRelay) {
+        castRequest(target, url, useRelay, owner -> owner.prepare(url, target.controlUrl));
+    }
+
+    void castLocal(DlnaRenderer target, Uri uri, String mime) {
+        if (uri == null) return;
+        castRequest(target, uri.toString(), true, owner -> owner.prepareLocal(uri, mime, target.controlUrl));
+    }
+
+    private interface RelayFactory { HttpRelay create(RelayService owner) throws Exception; }
+
+    private void castRequest(DlnaRenderer target, String displayUrl, boolean useRelay, RelayFactory factory) {
         if (busy) return;
         if (renderer != null && !renderer.controlUrl.equals(target.controlUrl)) {
             message = "请先停止并断开当前设备，再切换到其他设备";
@@ -57,7 +69,7 @@ final class CastSession {
                 @Override public void onServiceConnected(ComponentName name, IBinder binder) {
                     if (version != generation) return;
                     service = ((RelayService.LocalBinder) binder).service();
-                    busy = false; cast(target, url, true);
+                    busy = false; castRequest(target, displayUrl, true, factory);
                 }
                 @Override public void onServiceDisconnected(ComponentName name) {
                     if (binding == this) relayLost(service);
@@ -72,12 +84,12 @@ final class CastSession {
             }
             return;
         }
-        renderer = target; mediaUrl = url; info = null; reachable = false;
+        renderer = target; mediaUrl = displayUrl; info = null; reachable = false;
         RelayService owner = service;
         HttpRelay[] candidate = new HttpRelay[1];
         command("正在投送视频…", () -> {
-            if (useRelay) candidate[0] = owner.prepare(url, target.controlUrl);
-            target.play(useRelay ? candidate[0].url() : url);
+            if (useRelay) candidate[0] = factory.create(owner);
+            target.play(useRelay ? candidate[0].url() : displayUrl);
         }, false, error -> {
             if (error == null) {
                 if (useRelay) {

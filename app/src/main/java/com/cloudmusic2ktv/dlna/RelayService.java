@@ -10,6 +10,7 @@ import android.util.Log;
 import java.io.IOException;
 import java.net.*;
 import java.util.HashSet;
+import java.util.Locale;
 import java.util.Set;
 
 /** Keeps the single casting relay alive while the screen is off or the Activity is in background. */
@@ -70,6 +71,29 @@ public final class RelayService extends Service {
     }
 
     synchronized HttpRelay prepare(String url, String rendererUrl) throws IOException {
+        return prepareSource(new HttpRelaySourceFactory() {
+            @Override public HttpRelay create(InetAddress local, Network selected) throws IOException {
+                return new HttpRelay(local, url, endpoint -> (HttpURLConnection) selected.openConnection(endpoint),
+                        (method, status, bytes) -> Log.i("UrlDisplayDlna", "Relay " + method + " status=" + status + " bytes=" + bytes));
+            }
+        }, rendererUrl);
+    }
+
+    synchronized HttpRelay prepareLocal(android.net.Uri uri, String mime, String rendererUrl) throws IOException {
+        return prepareSource(new HttpRelaySourceFactory() {
+            @Override public HttpRelay create(InetAddress local, Network selected) throws IOException {
+                LocalMediaSource source = new LocalMediaSource(getContentResolver(), uri, mime);
+                String normalizedMime = mime == null ? "" : mime.toLowerCase(Locale.ROOT);
+                String extension = normalizedMime.contains("avi") ? ".avi" : ".mp4";
+                return new HttpRelay(local, extension, source,
+                        (method, status, bytes) -> Log.i("UrlDisplayDlna", "Local relay " + method + " status=" + status + " bytes=" + bytes));
+            }
+        }, rendererUrl);
+    }
+
+    private interface HttpRelaySourceFactory { HttpRelay create(InetAddress local, Network selected) throws IOException; }
+
+    private HttpRelay prepareSource(HttpRelaySourceFactory factory, String rendererUrl) throws IOException {
         if (closed) throw new IOException("手机中转已停止");
         InetAddress destination = InetAddress.getByName(new URL(rendererUrl).getHost());
         Network chosen = null;
@@ -89,9 +113,7 @@ public final class RelayService extends Service {
         }
         if (chosen == null) throw new IOException("手机中转需要可用的 Wi-Fi IPv4 网络");
         final Network selected = chosen;
-        HttpRelay relay = new HttpRelay(local, url,
-                endpoint -> (HttpURLConnection) selected.openConnection(endpoint),
-                (method, status, bytes) -> Log.i("UrlDisplayDlna", "Relay " + method + " status=" + status + " bytes=" + bytes));
+        HttpRelay relay = factory.create(local, selected);
         relays.add(relay); network = chosen; address = local;
         return relay;
     }
