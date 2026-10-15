@@ -26,9 +26,13 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # setup-android v3 still defaults to the removed legacy `tools`
+          # package. Install only packages that exist in current SDK repos.
+          packages: platform-tools
 
       - name: Install Android SDK packages
-        run: sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0"
 
       - name: Build and test
         run: ./gradlew test lint assembleDebug
